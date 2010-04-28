@@ -293,6 +293,9 @@ int __init garmin_bind_config(struct usb_composite_dev *cdev,
 	garmin->func.disable = garmin_disable;
 	garmin->func.descriptors = fs_garmin_descs;
 	garmin->func.hs_descriptors = hs_garmin_descs;
+/* 先預設都是 NULL by doremi */
+//	garmin->func.descriptors = NULL;
+//	garmin->func.hs_descriptors = NULL;
 
 	_garmin_dev = garmin;
 
@@ -361,3 +364,14 @@ int __init garmin_function_add(struct usb_composite_dev *cdev,
 
         return ret;
 }
+
+void garmin_function_enable(void)
+{
+        struct f_garmin *dev = _garmin_dev;
+
+        if (dev) {
+                dev->func.descriptors = fs_garmin_descs;
+                dev->func.hs_descriptors = hs_garmin_descs;
+        }
+}
+
