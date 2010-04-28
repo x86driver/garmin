@@ -345,11 +345,11 @@ int __init garmin_bind_config(struct usb_composite_dev *cdev,
 	garmin->func.bind = garmin_bind;
 	garmin->func.set_alt = garmin_set_alt;
 	garmin->func.disable = garmin_disable;
-//	garmin->func.descriptors = fs_garmin_descs;
-//	garmin->func.hs_descriptors = hs_garmin_descs;
+	garmin->func.descriptors = fs_garmin_descs;
+	garmin->func.hs_descriptors = hs_garmin_descs;
 /* 先預設都是 NULL by doremi */
-	garmin->func.descriptors = NULL;
-	garmin->func.hs_descriptors = NULL;
+//	garmin->func.descriptors = NULL;
+//	garmin->func.hs_descriptors = NULL;
 
 	_garmin_dev = garmin;
 
