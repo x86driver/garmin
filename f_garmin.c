@@ -72,6 +72,14 @@ static struct usb_endpoint_descriptor hs_garmin_out_desc = {
         .wMaxPacketSize		= __constant_cpu_to_le16(512),
 };
 
+static struct usb_endpoint_descriptor hs_garmin_int_desc = {
+        .bLength                = USB_DT_ENDPOINT_SIZE,
+        .bDescriptorType        = USB_DT_ENDPOINT,
+        .bmAttributes           = USB_ENDPOINT_XFER_INT,
+//      .bEndpointAddress       = USB_DIR_OUT,
+        .wMaxPacketSize         = __constant_cpu_to_le16(64),
+};
+
 static struct usb_endpoint_descriptor fs_garmin_in_desc = {
         .bLength                = USB_DT_ENDPOINT_SIZE,
         .bDescriptorType        = USB_DT_ENDPOINT,
@@ -86,13 +94,21 @@ static struct usb_endpoint_descriptor fs_garmin_out_desc = {
         .bEndpointAddress       = USB_DIR_OUT,
 };
 
+static struct usb_endpoint_descriptor fs_garmin_int_desc = {
+        .bLength                = USB_DT_ENDPOINT_SIZE,
+        .bDescriptorType        = USB_DT_ENDPOINT,
+        .bmAttributes           = USB_ENDPOINT_XFER_INT,
+        .bEndpointAddress       = USB_DIR_OUT,
+};
+
 static struct usb_interface_descriptor garmin_intf = {
         .bLength		= sizeof(garmin_intf),
         .bDescriptorType	= USB_DT_INTERFACE,
         .bNumEndpoints		= 2, /* in,out, WARNING: without int */
         .bInterfaceClass	= 0xFF,
-	.bInterfaceSubClass	= 0xFF,
-	.bInterfaceProtocol	= 0xFF,
+	.bInterfaceSubClass	= 0x42,
+	.bInterfaceProtocol	= 0x01,
+	.bInterfaceNumber	= 0,
         /* .iInterface = DYNAMIC */
 };
 
@@ -100,6 +116,7 @@ static struct usb_descriptor_header *hs_garmin_descs[] = {
         (struct usb_descriptor_header *) &garmin_intf,
         (struct usb_descriptor_header *) &hs_garmin_in_desc,
         (struct usb_descriptor_header *) &hs_garmin_out_desc,
+//	(struct usb_descriptor_header *) &hs_garmin_int_desc,
         NULL,
 };
 
@@ -107,6 +124,11 @@ static struct usb_descriptor_header *fs_garmin_descs[] = {
         (struct usb_descriptor_header *) &garmin_intf,
         (struct usb_descriptor_header *) &fs_garmin_in_desc,
         (struct usb_descriptor_header *) &fs_garmin_out_desc,
+//	(struct usb_descriptor_header *) &fs_garmin_int_desc,
+        NULL,
+};
+
+static struct usb_descriptor_header *null_garmin_descs[] = {
         NULL,
 };
 
@@ -121,17 +143,19 @@ static inline struct f_garmin *func_to_garmin(struct usb_function *f)
  */
 static void garmin_disable(struct usb_function *f)
 {
-
+	struct f_garmin *garmin = func_to_garmin(f);
+	usb_ep_disable(garmin->in_ep);
+	usb_ep_disable(garmin->out_ep);
 } 
 
 struct usb_request *alloc_ep_req(struct usb_ep *ep)
 {
         struct usb_request      *req;
 
-        req = usb_ep_alloc_request(ep, GFP_ATOMIC);
+        req = usb_ep_alloc_request(ep, GFP_KERNEL);
         if (req) {
                 req->length = buflen;
-                req->buf = kmalloc(buflen, GFP_ATOMIC);
+                req->buf = kmalloc(buflen, GFP_KERNEL);
                 if (!req->buf) {
                         usb_ep_free_request(ep, req);
                         req = NULL;
@@ -291,11 +315,11 @@ int __init garmin_bind_config(struct usb_composite_dev *cdev,
 	garmin->func.bind = garmin_bind;
 	garmin->func.set_alt = garmin_set_alt;
 	garmin->func.disable = garmin_disable;
-	garmin->func.descriptors = fs_garmin_descs;
-	garmin->func.hs_descriptors = hs_garmin_descs;
+//	garmin->func.descriptors = fs_garmin_descs;
+//	garmin->func.hs_descriptors = hs_garmin_descs;
 /* 先預設都是 NULL by doremi */
-//	garmin->func.descriptors = NULL;
-//	garmin->func.hs_descriptors = NULL;
+	garmin->func.descriptors = NULL;
+	garmin->func.hs_descriptors = NULL;
 
 	_garmin_dev = garmin;
 
