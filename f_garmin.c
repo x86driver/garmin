@@ -37,9 +37,10 @@ struct f_garmin {
 	struct usb_function func;
 	struct usb_ep *in_ep;
 	struct usb_ep *out_ep;
+	struct usb_ep *int_ep;
 };
 
-struct usb_request *global_in_req, *global_out_req;
+struct usb_request *global_in_req, *global_out_req, *global_int_req;
 static struct f_garmin *_garmin_dev;
 static unsigned qlen = 32;
 unsigned int buflen = 4096;
@@ -60,7 +61,6 @@ static struct usb_endpoint_descriptor hs_garmin_in_desc = {
         .bLength		= USB_DT_ENDPOINT_SIZE,
         .bDescriptorType	= USB_DT_ENDPOINT,
         .bmAttributes		= USB_ENDPOINT_XFER_BULK,
-//	.bEndpointAddress	= USB_DIR_IN,
         .wMaxPacketSize		= __constant_cpu_to_le16(512),
 };
 
@@ -68,7 +68,6 @@ static struct usb_endpoint_descriptor hs_garmin_out_desc = {
         .bLength		= USB_DT_ENDPOINT_SIZE,
         .bDescriptorType	= USB_DT_ENDPOINT,
         .bmAttributes		= USB_ENDPOINT_XFER_BULK,
-//	.bEndpointAddress	= USB_DIR_OUT,
         .wMaxPacketSize		= __constant_cpu_to_le16(512),
 };
 
@@ -76,7 +75,6 @@ static struct usb_endpoint_descriptor hs_garmin_int_desc = {
         .bLength                = USB_DT_ENDPOINT_SIZE,
         .bDescriptorType        = USB_DT_ENDPOINT,
         .bmAttributes           = USB_ENDPOINT_XFER_INT,
-//      .bEndpointAddress       = USB_DIR_OUT,
         .wMaxPacketSize         = __constant_cpu_to_le16(64),
 };
 
@@ -98,16 +96,16 @@ static struct usb_endpoint_descriptor fs_garmin_int_desc = {
         .bLength                = USB_DT_ENDPOINT_SIZE,
         .bDescriptorType        = USB_DT_ENDPOINT,
         .bmAttributes           = USB_ENDPOINT_XFER_INT,
-        .bEndpointAddress       = USB_DIR_OUT,
+        .bEndpointAddress       = USB_DIR_IN,
 };
 
 static struct usb_interface_descriptor garmin_intf = {
         .bLength		= sizeof(garmin_intf),
         .bDescriptorType	= USB_DT_INTERFACE,
-        .bNumEndpoints		= 2, /* in,out, WARNING: without int */
+        .bNumEndpoints		= 3, /* in,out, WARNING: without int */
         .bInterfaceClass	= 0xFF,
-	.bInterfaceSubClass	= 0x42,
-	.bInterfaceProtocol	= 0x01,
+	.bInterfaceSubClass	= 0xff,
+	.bInterfaceProtocol	= 0xff,
 	.bInterfaceNumber	= 0,
         /* .iInterface = DYNAMIC */
 };
@@ -116,7 +114,7 @@ static struct usb_descriptor_header *hs_garmin_descs[] = {
         (struct usb_descriptor_header *) &garmin_intf,
         (struct usb_descriptor_header *) &hs_garmin_in_desc,
         (struct usb_descriptor_header *) &hs_garmin_out_desc,
-//	(struct usb_descriptor_header *) &hs_garmin_int_desc,
+	(struct usb_descriptor_header *) &hs_garmin_int_desc,
         NULL,
 };
 
@@ -124,7 +122,7 @@ static struct usb_descriptor_header *fs_garmin_descs[] = {
         (struct usb_descriptor_header *) &garmin_intf,
         (struct usb_descriptor_header *) &fs_garmin_in_desc,
         (struct usb_descriptor_header *) &fs_garmin_out_desc,
-//	(struct usb_descriptor_header *) &fs_garmin_int_desc,
+	(struct usb_descriptor_header *) &fs_garmin_int_desc,
         NULL,
 };
 
@@ -146,6 +144,7 @@ static void garmin_disable(struct usb_function *f)
 	struct f_garmin *garmin = func_to_garmin(f);
 	usb_ep_disable(garmin->in_ep);
 	usb_ep_disable(garmin->out_ep);
+	usb_ep_disable(garmin->int_ep);
 } 
 
 struct usb_request *alloc_ep_req(struct usb_ep *ep)
@@ -178,6 +177,11 @@ static void garmin_in_complete(struct usb_ep *ep, struct usb_request *req)
         printk(KERN_ALERT "I got a IN request, %d!!\n", req->actual);
 }
 
+static void garmin_int_complete(struct usb_ep *ep, struct usb_request *req)
+{
+	printk(KERN_ALERT "I got a INT request, %d!!\n", req->actual);
+}
+
 /**
  * @bind: Before the gadget can register, all of its functions bind() to the
  *      available resources including string and interface identifiers used
@@ -194,26 +198,33 @@ static int __init garmin_bind(struct usb_configuration *c, struct usb_function *
 		return id;
 
 	garmin_intf.bInterfaceNumber = id;
-	garmin->in_ep = usb_ep_autoconfig(cdev->gadget, &fs_garmin_in_desc);
-	if (!garmin->in_ep) {
-autoconf_fail:
-		ERROR(cdev, "%s: can't autoconfig on %s\n",
-			f->name, cdev->gadget->name);
-		return -ENODEV;
-	}
 
+        garmin->out_ep = usb_ep_autoconfig(cdev->gadget, &fs_garmin_out_desc);
+        if (!garmin->out_ep) {
+autoconf_fail:
+                ERROR(cdev, "%s: can't autoconfig on %s\n",
+                        f->name, cdev->gadget->name);
+                return -ENODEV;
+        }
+        garmin->out_ep->driver_data = cdev;
+
+	garmin->in_ep = usb_ep_autoconfig(cdev->gadget, &fs_garmin_in_desc);
+	if (!garmin->in_ep)
+		goto autoconf_fail;
 	garmin->in_ep->driver_data = cdev;
 
-	garmin->out_ep = usb_ep_autoconfig(cdev->gadget, &fs_garmin_out_desc);
-	if (!garmin->out_ep)
+	garmin->int_ep = usb_ep_autoconfig(cdev->gadget, &fs_garmin_int_desc);
+	if (!garmin->int_ep)
 		goto autoconf_fail;
-	garmin->out_ep->driver_data = cdev;
+	garmin->int_ep->driver_data = cdev;
 
 	if (gadget_is_dualspeed(c->cdev->gadget)) {
-		hs_garmin_in_desc.bEndpointAddress =
-			fs_garmin_in_desc.bEndpointAddress;
 		hs_garmin_out_desc.bEndpointAddress =
 			fs_garmin_out_desc.bEndpointAddress;
+                hs_garmin_in_desc.bEndpointAddress =
+                        fs_garmin_in_desc.bEndpointAddress;
+		hs_garmin_int_desc.bEndpointAddress =
+			fs_garmin_int_desc.bEndpointAddress;
 	}
 
 	printk(KERN_ALERT "%s speed %s: IN/%d, OUT/%d\n",
@@ -230,13 +241,25 @@ autoconf_fail:
 
 static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin)
 {
-	const struct usb_endpoint_descriptor	*in, *out;
+	const struct usb_endpoint_descriptor	*in, *out, *INT;
 	struct usb_ep				*ep;
 	int					result;
 	struct usb_request			*req;
 
 	in = ep_choose(cdev->gadget, &hs_garmin_in_desc, &fs_garmin_in_desc);
 	out = ep_choose(cdev->gadget, &hs_garmin_out_desc, &fs_garmin_out_desc);
+	INT = ep_choose(cdev->gadget, &hs_garmin_int_desc, &fs_garmin_int_desc);
+
+        /* 這端點僅僅讀取 OUT 封包 */
+        ep = garmin->out_ep;
+        result = usb_ep_enable(ep, out);
+        if (result < 0) {
+                ep = garmin->in_ep;
+                usb_ep_disable(ep);
+                ep->driver_data = NULL;
+                return result;
+        }
+        ep->driver_data = garmin;
 
 	/* 這個端點透過 IN 寫入資料回去主機 */
 	ep = garmin->in_ep;
@@ -245,16 +268,13 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 		return result;
 	ep->driver_data = garmin;
 
-	/* 這端點僅僅讀取 OUT 封包 */
-	ep = garmin->out_ep;
-	result = usb_ep_enable(ep, out);
+	/* 開啟 INT endpoint */
+	result = usb_ep_enable(garmin->int_ep, INT);
 	if (result < 0) {
-		ep = garmin->in_ep;
-		usb_ep_disable(ep);
-		ep->driver_data = NULL;
+		usb_ep_disable(garmin->int_ep);
+		garmin->int_ep->driver_data = NULL;
 		return result;
 	}
-	ep->driver_data = garmin;
 
         /* 一開始要做的事情: 分配 req, req->buf, 設定 complete function */
         req = alloc_ep_req(garmin->out_ep);
@@ -276,6 +296,16 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 		}
 		global_in_req = req;
         }
+
+	req = alloc_ep_req(garmin->int_ep);
+	if (req) {
+		req->complete = garmin_int_complete;
+		result = usb_ep_queue(garmin->int_ep, req, GFP_ATOMIC);
+		if (result != 0) {
+			printk(KERN_ALERT "usb_ep_queue INT error\n");
+		}
+		global_int_req = req;
+	}
 
 	printk(KERN_ALERT "%s enabled\n", garmin->func.name);
 	return result;
@@ -349,7 +379,7 @@ static ssize_t garmin_read(struct file *fp, char __user *buf,
 	struct f_garmin *dev = fp->private_data;
 	int ret;
 	int i;
-	char buffer[16];
+	char buffer[64];
 
 
 	memcpy(&buffer[0], req->buf, req->actual);
