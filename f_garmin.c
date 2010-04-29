@@ -24,6 +24,7 @@
 #include <linux/miscdevice.h>
 #include <linux/types.h>
 #include <linux/fs.h>
+#include <linux/poll.h>
 
 //#include "epautoconf.c"
 //#include "composite.c"
@@ -297,6 +298,18 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 		global_in_req = req;
         }
 
+	/* 對於 IN 的 endpoint 應該只需要:
+	 * 1. 分配 buffer
+	 * 2. 設定完工函式
+	 * 3. 設定全域變數 global_xx_req
+	 */
+
+	req = alloc_ep_req(garmin->int_ep);
+	if (req) {
+		req->complete = garmin_int_complete;
+		global_int_req = req;
+	}
+/*
 	req = alloc_ep_req(garmin->int_ep);
 	if (req) {
 		req->complete = garmin_int_complete;
@@ -306,7 +319,7 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 		}
 		global_int_req = req;
 	}
-
+*/
 	printk(KERN_ALERT "%s enabled\n", garmin->func.name);
 	return result;
 }
@@ -394,11 +407,30 @@ static ssize_t garmin_read(struct file *fp, char __user *buf,
 	return 0;
 }
 
+static ssize_t garmin_write(struct file *fp, const char __user *buf,
+                                 size_t count, loff_t *pos)
+{
+	const char *str = "FUCK";
+	struct usb_request *req = global_int_req;
+	struct f_garmin *dev = fp->private_data;
+	int ret;
+
+	if (copy_from_user(req->buf, buf, count)) {	/* 我們都假設 count 不超過 4096 */
+		return -EFAULT;
+	}
+	req->length = count;
+
+	ret = usb_ep_queue(dev->int_ep, req, GFP_KERNEL);
+	if (ret < 0) {
+		return -EIO;
+	}
+	return count;
+}
 
 static struct file_operations garmin_fops = {
         .owner = THIS_MODULE,
         .read = garmin_read,
-	.write = NULL,
+	.write = garmin_write,
         .open = garmin_open,
         .release = garmin_release,
 };
