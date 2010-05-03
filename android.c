@@ -142,10 +142,10 @@ static int __init android_bind_config(struct usb_configuration *c)
         ret = mass_storage_function_add(dev->cdev, c, dev->nluns);
         if (ret)
                 return ret;
-        //ret = adb_function_add(dev->cdev, c);
+        ret = garmin_function_add(dev->cdev, c);
 	if (ret)
 		return ret;
-	ret = garmin_function_add(dev->cdev, c);
+	ret = adb_function_add(dev->cdev, c);
         return ret;
 }
 

@@ -168,7 +168,8 @@ static void garmin_out_complete(struct usb_ep *ep, struct usb_request *req)
 {
 //        struct f_garmin         *garmin = ep->driver_data;
 //        struct usb_composite_dev *cdev = garmin->func.config->cdev;
-	printk(KERN_ALERT "I got a OUT request, %d!!\n", req->actual);
+	global_out_req = req;
+	printk(KERN_ALERT "I got a OUT request, %d!!\n", global_out_req->actual);
 }
 
 static void garmin_in_complete(struct usb_ep *ep, struct usb_request *req)
@@ -176,6 +177,7 @@ static void garmin_in_complete(struct usb_ep *ep, struct usb_request *req)
 //        struct f_garmin         *garmin = ep->driver_data;
 //        struct usb_composite_dev *cdev = garmin->func.config->cdev;
         printk(KERN_ALERT "I got a IN request, %d!!\n", req->actual);
+	global_in_req = req;
 }
 
 static void garmin_int_complete(struct usb_ep *ep, struct usb_request *req)
@@ -388,37 +390,55 @@ static int garmin_release(struct inode *ip, struct file *fp)
 static ssize_t garmin_read(struct file *fp, char __user *buf,
                                 size_t count, loff_t *pos)
 {
+	/* 如果沒資料就先離開 */
+	if (global_out_req == NULL)
+		return 0;
 	struct usb_request *req = global_out_req;
 	struct f_garmin *dev = fp->private_data;
 	int ret;
-	int i;
+	int read_byte;
 	char buffer[64];
 
 
-	memcpy(&buffer[0], req->buf, req->actual);
-	buffer[req->actual] = 0;
-	printk(KERN_ALERT "%s", buffer);
+//	memcpy(&buffer[0], req->buf, req->actual);
+//	buffer[req->actual] = 0;
+//	printk(KERN_ALERT "%s", buffer);
+
+	read_byte = req->actual;
+	if (copy_to_user(buf, req->buf, req->actual)) {
+		return -EFAULT;
+	}
 
 	/* Prepare for next request */
 	ret = usb_ep_queue(dev->out_ep, req, GFP_ATOMIC);
 	if (ret < 0) {
 		return -EIO;
 	}
-	return 0;
+	return read_byte;
 }
 
 static ssize_t garmin_write(struct file *fp, const char __user *buf,
                                  size_t count, loff_t *pos)
 {
-	const char *str = "FUCK";
+	const char ESN[] = {0,0,0,0,
+			    6,0,0,0,
+			    4,0,0,0,
+			    0x0,0x94,0x35,0x77};
 	struct usb_request *req = global_int_req;
 	struct f_garmin *dev = fp->private_data;
 	int ret;
 
+#if 1
 	if (copy_from_user(req->buf, buf, count)) {	/* 我們都假設 count 不超過 4096 */
 		return -EFAULT;
 	}
 	req->length = count;
+#endif
+
+#if 0
+	memcpy(req->buf, ESN, sizeof(ESN));
+	req->length = sizeof(ESN);
+#endif
 
 	ret = usb_ep_queue(dev->int_ep, req, GFP_KERNEL);
 	if (ret < 0) {
