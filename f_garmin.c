@@ -31,9 +31,9 @@ MODULE_LICENSE("GPL");
 
 #define REQ_SIZE 32
 struct f_garmin {
-	struct semaphore sem;
+	struct semaphore sem_r, sem_w;
 	spinlock_t spinlock;
-	wait_queue_head_t wait;
+	wait_queue_head_t wait_r, wait_w;
 
 	struct usb_function func;
 
@@ -239,7 +239,7 @@ static void garmin_out_complete(struct usb_ep *ep, struct usb_request *req)
 	} else {
 		QUEUE(req, &_garmin_dev->req_head_out_busy);
 	}
-	wake_up(&_garmin_dev->wait);
+	wake_up(&_garmin_dev->wait_r);
 }
 
 static void garmin_in_complete(struct usb_ep *ep, struct usb_request *req)
@@ -250,6 +250,8 @@ static void garmin_in_complete(struct usb_ep *ep, struct usb_request *req)
 static void garmin_int_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	printk(KERN_ALERT "I got a INT request, %d!!\n", req->actual);
+	QUEUE(req, &_garmin_dev->req_head_int);
+	wake_up(&_garmin_dev->wait_w);
 }
 
 /**
@@ -351,17 +353,13 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 	        req = garmin->req_array_out[i] = alloc_ep_req(garmin->out_ep);
 	        if (req) {
         	        req->complete = garmin_out_complete;
-	        }
-		QUEUE(req, &garmin->req_head_out_free);
+			QUEUE(req, &garmin->req_head_out_free);
+		}
 	}
 
         req = alloc_ep_req(garmin->in_ep);
         if (req) {
                 req->complete = garmin_in_complete;
-		result = usb_ep_queue(garmin->in_ep, req, GFP_ATOMIC);
-		if (result != 0) {
-			printk(KERN_ALERT "usb_ep_queue IN error\n");
-		}
         }
 
 	/* 對於 IN 的 endpoint 應該只需要:
@@ -370,9 +368,12 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 	 * 3. 設定全域變數 global_xx_req
 	 */
 
-	req = alloc_ep_req(garmin->int_ep);
-	if (req) {
-		req->complete = garmin_int_complete;
+	for (i = 0; i < REQ_SIZE; ++i) {
+		req = garmin->req_array_int[i] = alloc_ep_req(garmin->int_ep);
+		if (req) {
+			req->complete = garmin_int_complete;
+			QUEUE(req, &garmin->req_head_int);
+		}
 	}
 
 	printk(KERN_ALERT "%s enabled\n", garmin->func.name);
@@ -411,8 +412,6 @@ int __init garmin_bind_config(struct usb_composite_dev *cdev,
 	if (garmin == NULL)
 		return -ENOMEM;
 
-	init_MUTEX(&garmin->sem);
-
 	garmin->func.name = "garmin";
 //	garmin->func.strings = garmin_strings;
 	garmin->func.bind = garmin_bind;
@@ -427,7 +426,10 @@ int __init garmin_bind_config(struct usb_composite_dev *cdev,
 
 	_garmin_dev = garmin;
 
-	init_waitqueue_head(&garmin->wait);
+	init_MUTEX(&garmin->sem_r);
+	init_MUTEX(&garmin->sem_w);
+	init_waitqueue_head(&garmin->wait_r);
+	init_waitqueue_head(&garmin->wait_w);
 	spin_lock_init(&garmin->spinlock);
 	init_list();
 
@@ -457,12 +459,12 @@ static int garmin_release(struct inode *ip, struct file *fp)
 static ssize_t garmin_read(struct file *fp, char __user *buf,
                                 size_t count, loff_t *pos)
 {
-	int ret;
+	int ret = 0;
 	int read_byte = 0;
 	struct usb_request *req;
 	struct f_garmin *dev = fp->private_data;
 
-	if (down_interruptible(&dev->sem)) {
+	if (down_interruptible(&dev->sem_r)) {
 		return -ERESTARTSYS;
 	}
 
@@ -504,7 +506,7 @@ requeue:
 		}
 
 		req = NULL;
-		ret = wait_event_interruptible(dev->wait, (req = DEQUE(&dev->req_head_out_busy)));
+		ret = wait_event_interruptible(dev->wait_r, (req = DEQUE(&dev->req_head_out_busy)));
 		if (req != NULL) {
 			if (req->actual == 0)
 				goto requeue;
@@ -522,11 +524,57 @@ requeue:
 	}
 
 fail:
-	up(&dev->sem);
+	up(&dev->sem_r);
 	return ret;
 }
 
 static ssize_t garmin_write(struct file *fp, const char __user *buf,
+				size_t count, loff_t *pos)
+{
+	struct f_garmin *dev = fp->private_data;
+	struct usb_request *req;
+	int write_byte;
+	int ret = 0;
+
+	down_interruptible(&dev->sem_w);
+
+	while (count > 0) {
+		ret = wait_event_interruptible(dev->wait_w, (req = DEQUE(&dev->req_head_int)));
+		if (req != NULL) {
+			if (count < buflen)
+				write_byte = count;
+			else
+				write_byte = buflen;
+		}
+
+		if (unlikely(ret < 0)) {
+			ret = -EAGAIN;
+			goto fail;
+		}
+
+		if (copy_from_user(req->buf, buf, write_byte)) {
+			ret = -EAGAIN;
+			goto fail;
+		}
+
+		count -= write_byte;
+		buf += write_byte;
+		req->length = write_byte;
+		
+		ret = usb_ep_queue(dev->int_ep, req, GFP_KERNEL);
+		if (ret < 0) {
+			ret = -EIO;
+			goto fail;
+		}
+		ret += write_byte;
+	}
+
+fail:
+	up(&dev->sem_w);
+	return ret;
+}
+
+static ssize_t garmin_write2(struct file *fp, const char __user *buf,
                                  size_t count, loff_t *pos)
 {
 	const char ESN[] = {0,0,0,0,
@@ -560,8 +608,7 @@ static ssize_t garmin_write(struct file *fp, const char __user *buf,
 static struct file_operations garmin_fops = {
         .owner = THIS_MODULE,
         .read = garmin_read,
-//	.write = garmin_write,
-	.write = NULL,	/* 暫時不支援 write, by doremi */
+	.write = garmin_write,
         .open = garmin_open,
         .release = garmin_release,
 };
