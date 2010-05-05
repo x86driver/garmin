@@ -60,17 +60,26 @@ unsigned int buflen = 4096;
 
 static inline void QUEUE(struct usb_request *p, struct list_head *head)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&_garmin_dev->spinlock, flags);
         list_add_tail(&p->list, head);
+	spin_unlock_irqrestore(&_garmin_dev->spinlock, flags);
 }
 
 static inline struct usb_request *DEQUE(struct list_head *head)
 {
         struct usb_request *tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&_garmin_dev->spinlock, flags);
 	if (list_empty(head)) {
+		spin_unlock_irqrestore(&_garmin_dev->spinlock, flags);
 		return NULL;
 	}
         tmp = list_first_entry(head, struct usb_request, list);
         list_del(&tmp->list);
+	spin_unlock_irqrestore(&_garmin_dev->spinlock, flags);
         return tmp;
 }
 
