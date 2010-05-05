@@ -25,26 +25,82 @@
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/poll.h>
-
-//#include "epautoconf.c"
-//#include "composite.c"
-//#include "config.c"
-//#include "usbstring.c"
+#include <linux/semaphore.h>
 
 MODULE_LICENSE("GPL");
 
+#define REQ_SIZE 32
 struct f_garmin {
-	spinlock_t lock;
+	struct semaphore sem;
+	spinlock_t spinlock;
+	wait_queue_head_t wait;
+
 	struct usb_function func;
-	struct usb_ep *in_ep;
-	struct usb_ep *out_ep;
-	struct usb_ep *int_ep;
+
+        struct usb_ep *in_ep;
+        struct usb_ep *out_ep;
+        struct usb_ep *int_ep;
+
+        struct list_head req_head_in;
+        struct list_head req_head_out_busy;
+	struct list_head req_head_out_free;
+        struct list_head req_head_int;
+
+	struct usb_request *req_array_in[REQ_SIZE];
+	struct usb_request *req_array_out[REQ_SIZE];
+	struct usb_request *req_array_int[REQ_SIZE];
+
+	struct usb_request *cur_read_req;
+	unsigned int cur_read_count;
+	unsigned char *cur_read_buf;
 };
 
-struct usb_request *global_in_req, *global_out_req, *global_int_req;
 static struct f_garmin *_garmin_dev;
-static unsigned qlen = 32;
 unsigned int buflen = 4096;
+
+static inline void QUEUE(struct usb_request *p, struct list_head *head)
+{
+        list_add_tail(&p->list, head);
+}
+
+static inline struct usb_request *DEQUE(struct list_head *head)
+{
+        struct usb_request *tmp;
+	if (list_empty(head)) {
+		return NULL;
+	}
+        tmp = list_first_entry(head, struct usb_request, list);
+        list_del(&tmp->list);
+        return tmp;
+}
+
+static void init_list(void)
+{
+        INIT_LIST_HEAD(&_garmin_dev->req_head_in);
+        INIT_LIST_HEAD(&_garmin_dev->req_head_out_busy);
+	INIT_LIST_HEAD(&_garmin_dev->req_head_out_free);
+        INIT_LIST_HEAD(&_garmin_dev->req_head_int);
+}
+
+static void __free_request(struct list_head *head)
+{
+        struct list_head *p, *n;
+        struct usb_request *req;
+
+        list_for_each_safe(p, n, head) {
+                req = list_entry(p, struct usb_request, list);
+                list_del(&req->list);
+                kfree(req->buf);
+        }
+}
+
+static void free_request(void)
+{
+        __free_request(&_garmin_dev->req_head_in);
+        __free_request(&_garmin_dev->req_head_out_busy);
+	__free_request(&_garmin_dev->req_head_out_free);
+        __free_request(&_garmin_dev->req_head_int);
+}
 
 #if 0
 static struct usb_gadget_strings garmin_string_table = {
@@ -166,18 +222,20 @@ struct usb_request *alloc_ep_req(struct usb_ep *ep)
 
 static void garmin_out_complete(struct usb_ep *ep, struct usb_request *req)
 {
-//        struct f_garmin         *garmin = ep->driver_data;
-//        struct usb_composite_dev *cdev = garmin->func.config->cdev;
-	global_out_req = req;
-	printk(KERN_ALERT "I got a OUT request, %d!!\n", global_out_req->actual);
+	int result;
+	printk(KERN_ALERT "I got a OUT request, %d!!\n", req->actual);
+	if (req->status != 0) {
+		printk(KERN_ALERT "usb out complete error\n");
+		QUEUE(req, &_garmin_dev->req_head_out_free);
+	} else {
+		QUEUE(req, &_garmin_dev->req_head_out_busy);
+	}
+	wake_up(&_garmin_dev->wait);
 }
 
 static void garmin_in_complete(struct usb_ep *ep, struct usb_request *req)
 {
-//        struct f_garmin         *garmin = ep->driver_data;
-//        struct usb_composite_dev *cdev = garmin->func.config->cdev;
         printk(KERN_ALERT "I got a IN request, %d!!\n", req->actual);
-	global_in_req = req;
 }
 
 static void garmin_int_complete(struct usb_ep *ep, struct usb_request *req)
@@ -246,7 +304,7 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 {
 	const struct usb_endpoint_descriptor	*in, *out, *INT;
 	struct usb_ep				*ep;
-	int					result;
+	int					result, i;
 	struct usb_request			*req;
 
 	in = ep_choose(cdev->gadget, &hs_garmin_in_desc, &fs_garmin_in_desc);
@@ -280,15 +338,13 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 	}
 
         /* 一開始要做的事情: 分配 req, req->buf, 設定 complete function */
-        req = alloc_ep_req(garmin->out_ep);
-        if (req) {
-                req->complete = garmin_out_complete;
-		result = usb_ep_queue(garmin->out_ep, req, GFP_ATOMIC);
-		if (result != 0) {
-			printk(KERN_ALERT "usb_ep_queue error!\n");
-		}
-                global_out_req = req;
-        }
+	for (i = 0; i < REQ_SIZE; ++i) {
+	        req = garmin->req_array_out[i] = alloc_ep_req(garmin->out_ep);
+	        if (req) {
+        	        req->complete = garmin_out_complete;
+	        }
+		QUEUE(req, &garmin->req_head_out_free);
+	}
 
         req = alloc_ep_req(garmin->in_ep);
         if (req) {
@@ -297,7 +353,6 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 		if (result != 0) {
 			printk(KERN_ALERT "usb_ep_queue IN error\n");
 		}
-		global_in_req = req;
         }
 
 	/* 對於 IN 的 endpoint 應該只需要:
@@ -309,19 +364,8 @@ static int enable_garmin(struct usb_composite_dev *cdev, struct f_garmin *garmin
 	req = alloc_ep_req(garmin->int_ep);
 	if (req) {
 		req->complete = garmin_int_complete;
-		global_int_req = req;
 	}
-/*
-	req = alloc_ep_req(garmin->int_ep);
-	if (req) {
-		req->complete = garmin_int_complete;
-		result = usb_ep_queue(garmin->int_ep, req, GFP_ATOMIC);
-		if (result != 0) {
-			printk(KERN_ALERT "usb_ep_queue INT error\n");
-		}
-		global_int_req = req;
-	}
-*/
+
 	printk(KERN_ALERT "%s enabled\n", garmin->func.name);
 	return result;
 }
@@ -343,6 +387,11 @@ static int garmin_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 	return enable_garmin(cdev, garmin);
 }
 
+static void garmin_unbind(struct usb_configuration *c, struct usb_function *f)
+{
+	printk(KERN_ALERT "[doremi] garmin unbind called\n");
+}
+
 int __init garmin_bind_config(struct usb_composite_dev *cdev,
 				struct usb_configuration *c)
 {
@@ -353,11 +402,12 @@ int __init garmin_bind_config(struct usb_composite_dev *cdev,
 	if (garmin == NULL)
 		return -ENOMEM;
 
-	spin_lock_init(&garmin->lock);
+	init_MUTEX(&garmin->sem);
 
 	garmin->func.name = "garmin";
 //	garmin->func.strings = garmin_strings;
 	garmin->func.bind = garmin_bind;
+	garmin->func.unbind = garmin_unbind;
 	garmin->func.set_alt = garmin_set_alt;
 	garmin->func.disable = garmin_disable;
 	garmin->func.descriptors = fs_garmin_descs;
@@ -367,6 +417,14 @@ int __init garmin_bind_config(struct usb_composite_dev *cdev,
 //	garmin->func.hs_descriptors = NULL;
 
 	_garmin_dev = garmin;
+
+	init_waitqueue_head(&garmin->wait);
+	spin_lock_init(&garmin->spinlock);
+	init_list();
+
+	/* Init variable for read request */
+	garmin->cur_read_count = 0;
+	garmin->cur_read_buf = NULL;
 
 	status = usb_add_function(c, &garmin->func);
 	if (status)
@@ -390,31 +448,73 @@ static int garmin_release(struct inode *ip, struct file *fp)
 static ssize_t garmin_read(struct file *fp, char __user *buf,
                                 size_t count, loff_t *pos)
 {
-	/* 如果沒資料就先離開 */
-	if (global_out_req == NULL)
-		return 0;
-	struct usb_request *req = global_out_req;
-	struct f_garmin *dev = fp->private_data;
 	int ret;
-	int read_byte;
-	char buffer[64];
+	int read_byte = 0;
+	struct usb_request *req;
+	struct f_garmin *dev = fp->private_data;
 
-
-//	memcpy(&buffer[0], req->buf, req->actual);
-//	buffer[req->actual] = 0;
-//	printk(KERN_ALERT "%s", buffer);
-
-	read_byte = req->actual;
-	if (copy_to_user(buf, req->buf, req->actual)) {
-		return -EFAULT;
+	if (down_interruptible(&dev->sem)) {
+		return -ERESTARTSYS;
 	}
 
-	/* Prepare for next request */
-	ret = usb_ep_queue(dev->out_ep, req, GFP_ATOMIC);
-	if (ret < 0) {
-		return -EIO;
+	/* 如果使用者要求的資料還沒傳完 */
+	while (count > 0) {
+		/* 把所有 free queue 的 req 拿出來, 丟到 usb_ep_queue */
+		while ((req = DEQUE(&dev->req_head_out_free))) {
+requeue:
+			req->length = buflen;
+			ret = usb_ep_queue(dev->out_ep, req, GFP_KERNEL);
+			if (ret < 0) {
+				printk(KERN_ALERT "USB error!\n");
+				ret = -EIO;
+				goto fail;
+			}
+		}
+
+		if (dev->cur_read_count) {
+			if (dev->cur_read_count < count)
+				read_byte = dev->cur_read_count;
+			else
+				read_byte = count;
+
+			if (copy_to_user(buf, dev->cur_read_buf, read_byte)) {
+				ret = -EAGAIN;
+				goto fail;
+			}
+
+			dev->cur_read_count -= read_byte;
+			dev->cur_read_buf += read_byte;
+			count -= read_byte;
+			buf += read_byte;
+			
+			if (dev->cur_read_count == 0) {
+				QUEUE(dev->cur_read_req, &dev->req_head_out_free);
+				dev->cur_read_req = NULL;
+			}
+			continue;
+		}
+
+		req = NULL;
+		ret = wait_event_interruptible(dev->wait, (req = DEQUE(&dev->req_head_out_busy)));
+		if (req != NULL) {
+			if (req->actual == 0)
+				goto requeue;
+
+			dev->cur_read_req = req;
+			dev->cur_read_count = req->actual;
+			dev->cur_read_buf = req->buf;
+			printk(KERN_ALERT "First char: %c\n", dev->cur_read_buf[0]);
+		}
+
+		if (ret < 0) {
+			ret = -EAGAIN;
+			goto fail;
+		}
 	}
-	return read_byte;
+
+fail:
+	up(&dev->sem);
+	return ret;
 }
 
 static ssize_t garmin_write(struct file *fp, const char __user *buf,
@@ -424,33 +524,35 @@ static ssize_t garmin_write(struct file *fp, const char __user *buf,
 			    6,0,0,0,
 			    4,0,0,0,
 			    0x0,0x94,0x35,0x77};
-	struct usb_request *req = global_int_req;
 	struct f_garmin *dev = fp->private_data;
 	int ret;
 
-#if 1
+#if 0
 	if (copy_from_user(req->buf, buf, count)) {	/* 我們都假設 count 不超過 4096 */
 		return -EFAULT;
 	}
 	req->length = count;
 #endif
 
-#if 0
+#if 0 //這部份是直接把 ESN 傳回去 而不管 user space 傳甚饃進來
 	memcpy(req->buf, ESN, sizeof(ESN));
 	req->length = sizeof(ESN);
 #endif
 
+#if 0
 	ret = usb_ep_queue(dev->int_ep, req, GFP_KERNEL);
 	if (ret < 0) {
 		return -EIO;
 	}
+#endif
 	return count;
 }
 
 static struct file_operations garmin_fops = {
         .owner = THIS_MODULE,
         .read = garmin_read,
-	.write = garmin_write,
+//	.write = garmin_write,
+	.write = NULL,	/* 暫時不支援 write, by doremi */
         .open = garmin_open,
         .release = garmin_release,
 };
